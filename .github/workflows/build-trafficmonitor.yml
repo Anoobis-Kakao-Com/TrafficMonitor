@@ -1,1 +1,297 @@
+name: Build TrafficMonitor (aligned)
 
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Get TrafficMonitor V1.86 source
+        uses: actions/checkout@v4
+        with:
+          repository: zhongyang219/TrafficMonitor
+          ref: V1.86
+
+      - name: Apply patches
+        shell: python
+        run: |
+          def patch(path, edits):
+              raw = open(path, 'rb').read()
+              bom = raw.startswith(b'\xef\xbb\xbf')
+              text = raw.decode('utf-8-sig')
+              crlf = '\r\n' in text
+              text = text.replace('\r\n', '\n')
+              for old, new in edits:
+                  n = text.count(old)
+                  if n != 1:
+                      raise SystemExit('PATCH FAILED: %r found %d times in %s' % (old[:50], n, path))
+                  text = text.replace(old, new)
+              if crlf:
+                  text = text.replace('\n', '\r\n')
+              out = text.encode('utf-8')
+              if bom:
+                  out = b'\xef\xbb\xbf' + out
+              open(path, 'wb').write(out)
+
+          # (1) both rows of a column get the same label box width
+          width_anchor = '    int item_count = static_cast<int>(m_item_widths.size());\n'
+          width_block = width_anchor + r'''
+              // [patch] make the upper and lower item of the same column line up:
+              //  - label box (name + colon) equally wide  -> colons and values start at the same x
+              //  - number box of the value equally wide   -> units start at the same x
+              // (items with width 0 / no number part, e.g. custom drawn plugin items, are skipped)
+              if (m_taskbar_on_top_or_bottom && !horizontal_arrange)
+              {
+                  for (int i = 0; i + 1 < item_count; i += 2)
+                  {
+                      ItemWidth& up = m_item_widths[i].item_width;
+                      ItemWidth& down = m_item_widths[i + 1].item_width;
+                      if (up.label_width > 0 && down.label_width > 0)
+                      {
+                          int label_max = max(up.label_width, down.label_width);
+                          up.label_width = label_max;
+                          down.label_width = label_max;
+                      }
+                      if (up.num_width > 0 && down.num_width > 0)
+                      {
+                          int num_max = max(up.num_width, down.num_width);
+                          up.value_width += num_max - up.num_width;
+                          down.value_width += num_max - down.num_width;
+                          up.num_width = num_max;
+                          down.num_width = num_max;
+                      }
+                  }
+              }
+          '''
+
+          # (2) label helpers: box width (name + colon) and drawing (name / colon / value have separate alignment)
+          helper_anchor = 'void CTaskBarDlg::DrawDisplayItem(IDrawCommon& drawer, DisplayItem type, CRect rect, int label_width, bool vertical)\n'
+          helper = r"""// [patch] Width of the label box = width of the name text + width of the colon that is always
+          // appended after a non-empty name. An empty name gives 0 (no label, only the value is shown).
+          static int LabelBoxWidth(CDC* pDC, const wchar_t* text)
+          {
+              if (pDC == nullptr || text == nullptr || text[0] == L'\0')
+                  return 0;
+              std::wstring str(text);
+              return pDC->GetTextExtent(str.c_str(), static_cast<int>(str.size())).cx + pDC->GetTextExtent(L":", 1).cx;
+          }
+
+          // [patch] Draw a label as three separately aligned parts:
+          //  - name : spread evenly inside the name box (left margin = gap between letters = right margin),
+          //           the name box is as wide as the longest name of the column
+          //  - colon: always drawn at the same x (right end of the label box)
+          //  - value: starts at the right of the label box (drawn by the caller)
+          static void DrawJustifiedLabel(IDrawCommon& drawer, CDC* pDC, CFont* font, CRect rect_label, const wchar_t* text, int label_width, COLORREF color, bool vertical)
+          {
+              std::wstring str(text != nullptr ? text : L"");
+              if (str.empty())
+                  return;
+              if (vertical || pDC == nullptr || font == nullptr || label_width <= 0)
+              {
+                  drawer.DrawWindowText(rect_label, str.c_str(), color, vertical ? IDrawCommon::Alignment::CENTER : IDrawCommon::Alignment::LEFT);
+                  return;
+              }
+
+              // split the name into units (a surrogate pair counts as one unit)
+              std::vector<size_t> starts;
+              for (size_t k = 0; k < str.size(); ++k)
+              {
+                  bool low_surrogate = str[k] >= 0xDC00 && str[k] <= 0xDFFF;
+                  if (k > 0 && low_surrogate && str[k - 1] >= 0xD800 && str[k - 1] <= 0xDBFF)
+                      continue;
+                  starts.push_back(k);
+              }
+              int units = static_cast<int>(starts.size());
+
+              // measure with the same font as the layout
+              CFont* old_font = pDC->SelectObject(font);
+              int colon_w = pDC->GetTextExtent(L":", 1).cx;
+              int name_w = pDC->GetTextExtent(str.c_str(), static_cast<int>(str.size())).cx;
+              int extra = (label_width - colon_w) - name_w;     // free space inside the name box
+              std::vector<int> x_pos;
+              std::vector<std::wstring> pieces;
+              if (extra > 0)
+              {
+                  for (int u = 0; u < units; ++u)
+                  {
+                      size_t begin = starts[u];
+                      size_t end = (u + 1 < units) ? starts[u + 1] : str.size();
+                      int prefix = begin > 0 ? pDC->GetTextExtent(str.c_str(), static_cast<int>(begin)).cx : 0;
+                      x_pos.push_back(prefix + extra * (u + 1) / (units + 1));
+                      pieces.push_back(str.substr(begin, end - begin));
+                  }
+              }
+              pDC->SelectObject(old_font);
+
+              // name
+              if (extra > 0)
+              {
+                  for (int u = 0; u < units; ++u)
+                  {
+                      CRect r = rect_label;
+                      r.left = rect_label.left + x_pos[u];
+                      r.right = rect_label.right + 8;
+                      drawer.DrawWindowText(r, pieces[u].c_str(), color, IDrawCommon::Alignment::LEFT);
+                  }
+              }
+              else
+              {
+                  drawer.DrawWindowText(rect_label, str.c_str(), color, IDrawCommon::Alignment::LEFT);
+              }
+
+              // colon (same position in every row of the column)
+              CRect rc = rect_label;
+              rc.left = rect_label.left + label_width - colon_w;
+              rc.right = rect_label.right + 8;
+              drawer.DrawWindowText(rc, L":", color, IDrawCommon::Alignment::LEFT);
+          }
+
+
+          // [patch] characters that belong to the number part of a value (digits, decimal point, sign, "--")
+          static bool IsNumberChar(wchar_t c)
+          {
+              return (c >= L'0' && c <= L'9') || c == L'.' || c == L',' || c == L'-' || c == L'+' || c == 0x2212;
+          }
+
+          // [patch] Width of the value box for a sample text, split into number part and unit part.
+          // Returns number width + unit width and stores the number width in num_width
+          // (num_width = 0 means the sample has no number part: keep the old behaviour).
+          static int ValueBoxWidths(CDC* pDC, const wchar_t* sample, int& num_width)
+          {
+              num_width = 0;
+              if (pDC == nullptr || sample == nullptr || sample[0] == L'\0')
+                  return 0;
+              std::wstring str(sample);
+              size_t n = 0;
+              while (n < str.size() && IsNumberChar(str[n]))
+                  ++n;
+              if (n == 0)
+                  return pDC->GetTextExtent(str.c_str(), static_cast<int>(str.size())).cx;
+              num_width = pDC->GetTextExtent(str.c_str(), static_cast<int>(n)).cx;
+              int unit_width = 0;
+              if (n < str.size())
+                  unit_width = pDC->GetTextExtent(str.c_str() + n, static_cast<int>(str.size() - n)).cx;
+              return num_width + unit_width;
+          }
+
+          // [patch] Draw a value as two parts: the number right aligned inside the number box and the
+          // unit left aligned right behind it. "NaN" is centered in the whole value area.
+          static void DrawSplitValue(IDrawCommon& drawer, CRect rect_value, const wchar_t* text, int num_width, COLORREF color, IDrawCommon::Alignment original_alignment, bool vertical)
+          {
+              std::wstring str(text != nullptr ? text : L"");
+              if (vertical || num_width <= 0 || str.empty())
+              {
+                  drawer.DrawWindowText(rect_value, str.c_str(), color, original_alignment);
+                  return;
+              }
+              if (_wcsicmp(str.c_str(), L"NaN") == 0)
+              {
+                  drawer.DrawWindowText(rect_value, str.c_str(), color, IDrawCommon::Alignment::CENTER);
+                  return;
+              }
+              size_t n = 0;
+              while (n < str.size() && IsNumberChar(str[n]))
+                  ++n;
+              if (n == 0)
+              {
+                  drawer.DrawWindowText(rect_value, str.c_str(), color, original_alignment);
+                  return;
+              }
+              std::wstring number = str.substr(0, n);
+              std::wstring unit = str.substr(n);
+
+              CRect rect_number = rect_value;
+              rect_number.left = rect_value.left - 24;            // room so that a too wide number is not cut
+              rect_number.right = rect_value.left + num_width;
+              drawer.DrawWindowText(rect_number, number.c_str(), color, IDrawCommon::Alignment::RIGHT);
+              if (!unit.empty())
+              {
+                  CRect rect_unit = rect_value;
+                  rect_unit.left = rect_value.left + num_width;
+                  drawer.DrawWindowText(rect_unit, unit.c_str(), color, IDrawCommon::Alignment::LEFT);
+              }
+          }
+
+          """
+          call1_old = 'drawer.DrawWindowText(rect_label, str_label.c_str(), label_color, (vertical ? IDrawCommon::Alignment::CENTER : IDrawCommon::Alignment::LEFT));'
+          call1_new = 'DrawJustifiedLabel(drawer, m_pDC, &m_font, rect_label, str_label.c_str(), label_width, label_color, vertical);'
+          call2_old = 'drawer.DrawWindowText(rect_label, lable_text, label_text_color, (vertical ? IDrawCommon::Alignment::CENTER : IDrawCommon::Alignment::LEFT));'
+          call2_new = 'DrawJustifiedLabel(drawer, m_pDC, &m_font, rect_label, lable_text, label_width, label_text_color, vertical);'
+          # label widths in CalculateWindowSize now include the colon
+          w1_old = 'label_width = m_pDC->GetTextExtent(lable_text).cx;'
+          w1_new = 'label_width = LabelBoxWidth(m_pDC, lable_text);'
+          w2_old = 'item_widths[*iter].label_width = m_pDC->GetTextExtent(theApp.m_taskbar_data.disp_str.GetConst(*iter).c_str()).cx;'
+          w2_new = 'item_widths[*iter].label_width = LabelBoxWidth(m_pDC, theApp.m_taskbar_data.disp_str.GetConst(*iter).c_str());'
+
+          # value drawing (built-in items / plugin items) and value box widths
+          v1_old = 'drawer.DrawWindowText(rect_value, str_value, text_color, value_alignment);'
+          v1_new = r'''int num_width = 0;
+              {
+                  CommonDisplayItem key(type);
+                  for (const auto& w : m_item_widths)
+                  {
+                      if (w == key)
+                      {
+                          num_width = w.item_width.num_width;
+                          break;
+                      }
+                  }
+              }
+              DrawSplitValue(drawer, rect_value, str_value, num_width, text_color, value_alignment, vertical);'''
+          v2_old = 'drawer.DrawWindowText(rect_value, item->GetItemValueText(), value_text_color, value_alignment);'
+          v2_new = r'''int num_width = 0;
+                  {
+                      CommonDisplayItem key(item);
+                      for (const auto& w : m_item_widths)
+                      {
+                          if (w == key)
+                          {
+                              num_width = w.item_width.num_width;
+                              break;
+                          }
+                      }
+                  }
+                  DrawSplitValue(drawer, rect_value, item->GetItemValueText(), num_width, value_text_color, value_alignment, vertical);'''
+          sw1_old = 'value_width = m_pDC->GetTextExtent(plugin->GetItemValueSampleText()).cx;'
+          sw1_new = 'value_width = ValueBoxWidths(m_pDC, plugin->GetItemValueSampleText(), item_widths[plugin].num_width);'
+          sw2_old = 'item_widths[*iter].value_width = m_pDC->GetTextExtent(sample_str).cx;'
+          sw2_new = 'item_widths[*iter].value_width = ValueBoxWidths(m_pDC, sample_str, item_widths[*iter].num_width);'
+
+          patch('TrafficMonitor/TaskBarDlg.cpp', [
+              (width_anchor, width_block),
+              (helper_anchor, helper + helper_anchor),
+              (call1_old, call1_new),
+              (call2_old, call2_new),
+              (w1_old, w1_new),
+              (w2_old, w2_new),
+              (v1_old, v1_new),
+              (v2_old, v2_new),
+              (sw1_old, sw1_new),
+              (sw2_old, sw2_new),
+          ])
+
+          # the number box width is stored next to the other widths
+          patch('TrafficMonitor/TaskBarDlg.h', [
+              ('int value_width{};', 'int num_width{};\n        int value_width{};'),
+          ])
+
+          # (3) CPU clock: reserve the width of the widest sample text
+          patch('TrafficMonitor/DisplayItem.cpp', [
+              ('sample_str = _T("1.00 GHz");', 'sample_str = _T("8.88 GHz");'),
+              ('sample_str = _T("1.00GHz");', 'sample_str = _T("8.88GHz");'),
+          ])
+          print('patches applied')
+
+      - name: Add msbuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build (full version, x64)
+        run: msbuild TrafficMonitor.sln -p:Configuration=Release -p:Platform=x64 -p:PlatformToolset=v143 -m
+
+      - name: Upload TrafficMonitor.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrafficMonitor-aligned
+          path: Bin/x64/Release/TrafficMonitor.exe
+          if-no-files-found: error
