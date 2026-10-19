@@ -169,14 +169,18 @@ jobs:
               if (n == 0)
                   return pDC->GetTextExtent(str.c_str(), static_cast<int>(str.size())).cx;
               num_width = pDC->GetTextExtent(str.c_str(), static_cast<int>(n)).cx;
+              size_t m = n;
+              while (m < str.size() && (str[m] == L' ' || str[m] == 0x00A0))      // no gap between number and unit
+                  ++m;
               int unit_width = 0;
-              if (n < str.size())
-                  unit_width = pDC->GetTextExtent(str.c_str() + n, static_cast<int>(str.size() - n)).cx;
+              if (m < str.size())
+                  unit_width = pDC->GetTextExtent(str.c_str() + m, static_cast<int>(str.size() - m)).cx;
               return num_width + unit_width;
           }
 
           // [patch] Draw a value as two parts: the number right aligned inside the number box and the
-          // unit left aligned right behind it. "NaN" is centered in the whole value area.
+          // unit left aligned right behind it (spaces between number and unit are dropped).
+          // "NaN" is centered in the whole value area.
           static void DrawSplitValue(IDrawCommon& drawer, CRect rect_value, const wchar_t* text, int num_width, COLORREF color, IDrawCommon::Alignment original_alignment, bool vertical)
           {
               std::wstring str(text != nullptr ? text : L"");
@@ -198,8 +202,11 @@ jobs:
                   drawer.DrawWindowText(rect_value, str.c_str(), color, original_alignment);
                   return;
               }
+              size_t m = n;
+              while (m < str.size() && (str[m] == L' ' || str[m] == 0x00A0))      // no gap between number and unit
+                  ++m;
               std::wstring number = str.substr(0, n);
-              std::wstring unit = str.substr(n);
+              std::wstring unit = str.substr(m);
 
               CRect rect_number = rect_value;
               rect_number.left = rect_value.left - 24;            // room so that a too wide number is not cut
