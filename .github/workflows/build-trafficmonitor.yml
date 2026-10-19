@@ -38,9 +38,9 @@ jobs:
           width_anchor = '    int item_count = static_cast<int>(m_item_widths.size());\n'
           width_block = width_anchor + r'''
               // [patch] make the upper and lower item of the same column line up:
-              //  - label box (name + colon) equally wide  -> colons and values start at the same x
-              //  - number box of the value equally wide   -> units start at the same x
-              // (items with width 0 / no number part, e.g. custom drawn plugin items, are skipped)
+              //  - label box (name + gap + colon) equally wide -> colons and values start at the same x
+              //  - number box of the value equally wide        -> units start at the same x
+              // Only when both rows have a name. A row without a name is centered (see DrawSplitValue).
               if (m_taskbar_on_top_or_bottom && !horizontal_arrange)
               {
                   for (int i = 0; i + 1 < item_count; i += 2)
@@ -52,14 +52,14 @@ jobs:
                           int label_max = max(up.label_width, down.label_width);
                           up.label_width = label_max;
                           down.label_width = label_max;
-                      }
-                      if (up.num_width > 0 && down.num_width > 0)
-                      {
-                          int num_max = max(up.num_width, down.num_width);
-                          up.value_width += num_max - up.num_width;
-                          down.value_width += num_max - down.num_width;
-                          up.num_width = num_max;
-                          down.num_width = num_max;
+                          if (up.num_width > 0 && down.num_width > 0)
+                          {
+                              int num_max = max(up.num_width, down.num_width);
+                              up.value_width += num_max - up.num_width;
+                              down.value_width += num_max - down.num_width;
+                              up.num_width = num_max;
+                              down.num_width = num_max;
+                          }
                       }
                   }
               }
@@ -67,14 +67,14 @@ jobs:
 
           # (2) label helpers: box width (name + colon) and drawing (name / colon / value have separate alignment)
           helper_anchor = 'void CTaskBarDlg::DrawDisplayItem(IDrawCommon& drawer, DisplayItem type, CRect rect, int label_width, bool vertical)\n'
-          helper = r"""// [patch] Width of the label box = width of the name text + width of the colon that is always
-          // appended after a non-empty name. An empty name gives 0 (no label, only the value is shown).
+          helper = r"""// [patch] Width of the label box = name text + minimum gap + colon that is always appended
+          // after a non-empty name. An empty name gives 0 (no label, only the value is shown).
           static int LabelBoxWidth(CDC* pDC, const wchar_t* text)
           {
               if (pDC == nullptr || text == nullptr || text[0] == L'\0')
                   return 0;
               std::wstring str(text);
-              return pDC->GetTextExtent(str.c_str(), static_cast<int>(str.size())).cx + pDC->GetTextExtent(L":", 1).cx;
+              return pDC->GetTextExtent(str.c_str(), static_cast<int>(str.size())).cx + theApp.DPI(2) + pDC->GetTextExtent(L":", 1).cx;
           }
 
           // [patch] Draw a label as three separately aligned parts:
@@ -108,7 +108,8 @@ jobs:
               CFont* old_font = pDC->SelectObject(font);
               int colon_w = pDC->GetTextExtent(L":", 1).cx;
               int name_w = pDC->GetTextExtent(str.c_str(), static_cast<int>(str.size())).cx;
-              int extra = (label_width - colon_w) - name_w;     // free space inside the name box
+              int gap = theApp.DPI(2);                           // minimum gap between the name and the colon
+              int extra = (label_width - colon_w - gap) - name_w;     // free space inside the name box
               std::vector<int> x_pos;
               std::vector<std::wstring> pieces;
               if (extra > 0)
@@ -178,13 +179,30 @@ jobs:
               return num_width + unit_width;
           }
 
-          // [patch] Draw a value as two parts: the number right aligned inside the number box and the
-          // unit left aligned right behind it (spaces between number and unit are dropped).
-          // "NaN" is centered in the whole value area.
-          static void DrawSplitValue(IDrawCommon& drawer, CRect rect_value, const wchar_t* text, int num_width, COLORREF color, IDrawCommon::Alignment original_alignment, bool vertical)
+          // [patch] Pad characters for the empty digit positions, read once from config.ini
+          // ([task_bar] value_pad_char). Default U+2025; an empty value switches the padding off.
+          static const std::wstring& ValuePadChars()
+          {
+              static bool loaded = false;
+              static std::wstring pad = L"\u2025";
+              if (!loaded)
+              {
+                  loaded = true;
+                  CIniHelper ini{ theApp.m_config_path };
+                  pad = ini.GetString(L"task_bar", L"value_pad_char", L"\u2025");
+              }
+              return pad;
+          }
+
+          // [patch] Draw a value:
+          //  - with a name : number right aligned inside the number box, unit left aligned right behind it
+          //                  (spaces between number and unit are dropped), empty digit positions filled with
+          //                  the pad characters. "NaN" is centered in the whole value area.
+          //  - without name: number and unit joined and centered in the whole width of the column.
+          static void DrawSplitValue(IDrawCommon& drawer, CDC* pDC, CFont* font, CRect rect_value, const wchar_t* text, int num_width, bool has_label, COLORREF color, IDrawCommon::Alignment original_alignment, bool vertical)
           {
               std::wstring str(text != nullptr ? text : L"");
-              if (vertical || num_width <= 0 || str.empty())
+              if (vertical || str.empty())
               {
                   drawer.DrawWindowText(rect_value, str.c_str(), color, original_alignment);
                   return;
@@ -197,16 +215,23 @@ jobs:
               size_t n = 0;
               while (n < str.size() && IsNumberChar(str[n]))
                   ++n;
-              if (n == 0)
-              {
-                  drawer.DrawWindowText(rect_value, str.c_str(), color, original_alignment);
-                  return;
-              }
               size_t m = n;
               while (m < str.size() && (str[m] == L' ' || str[m] == 0x00A0))      // no gap between number and unit
                   ++m;
               std::wstring number = str.substr(0, n);
               std::wstring unit = str.substr(m);
+
+              if (!has_label)
+              {
+                  std::wstring joined = number + unit;
+                  drawer.DrawWindowText(rect_value, joined.c_str(), color, IDrawCommon::Alignment::CENTER);
+                  return;
+              }
+              if (num_width <= 0 || n == 0)
+              {
+                  drawer.DrawWindowText(rect_value, str.c_str(), color, original_alignment);
+                  return;
+              }
 
               CRect rect_number = rect_value;
               rect_number.left = rect_value.left - 24;            // room so that a too wide number is not cut
@@ -217,6 +242,33 @@ jobs:
                   CRect rect_unit = rect_value;
                   rect_unit.left = rect_value.left + num_width;
                   drawer.DrawWindowText(rect_unit, unit.c_str(), color, IDrawCommon::Alignment::LEFT);
+              }
+
+              // fill the empty digit positions (left of the number) with the pad characters
+              const std::wstring& pad = ValuePadChars();
+              if (!pad.empty() && pDC != nullptr && font != nullptr)
+              {
+                  CFont* old_font = pDC->SelectObject(font);
+                  int number_w = pDC->GetTextExtent(number.c_str(), static_cast<int>(number.size())).cx;
+                  int pad_w = pDC->GetTextExtent(pad.c_str(), static_cast<int>(pad.size())).cx;
+                  pDC->SelectObject(old_font);
+                  int space = num_width - number_w;
+                  if (pad_w > 0 && space > 0)
+                  {
+                      int count = (space + pad_w / 4) / pad_w;
+                      if (count > 8)
+                          count = 8;
+                      if (count > 0)
+                      {
+                          std::wstring pads;
+                          for (int i = 0; i < count; ++i)
+                              pads += pad;
+                          CRect rect_pad = rect_value;
+                          rect_pad.left = rect_value.left - 24;
+                          rect_pad.right = rect_value.left + num_width - number_w;
+                          drawer.DrawWindowText(rect_pad, pads.c_str(), color, IDrawCommon::Alignment::RIGHT);
+                      }
+                  }
               }
           }
 
@@ -245,7 +297,7 @@ jobs:
                       }
                   }
               }
-              DrawSplitValue(drawer, rect_value, str_value, num_width, text_color, value_alignment, vertical);'''
+              DrawSplitValue(drawer, m_pDC, &m_font, rect_value, str_value, num_width, label_width > 0, text_color, value_alignment, vertical);'''
           v2_old = 'drawer.DrawWindowText(rect_value, item->GetItemValueText(), value_text_color, value_alignment);'
           v2_new = r'''int num_width = 0;
                   {
@@ -259,7 +311,7 @@ jobs:
                           }
                       }
                   }
-                  DrawSplitValue(drawer, rect_value, item->GetItemValueText(), num_width, value_text_color, value_alignment, vertical);'''
+                  DrawSplitValue(drawer, m_pDC, &m_font, rect_value, item->GetItemValueText(), num_width, label_width > 0, value_text_color, value_alignment, vertical);'''
           sw1_old = 'value_width = m_pDC->GetTextExtent(plugin->GetItemValueSampleText()).cx;'
           sw1_new = 'value_width = ValueBoxWidths(m_pDC, plugin->GetItemValueSampleText(), item_widths[plugin].num_width);'
           sw2_old = 'item_widths[*iter].value_width = m_pDC->GetTextExtent(sample_str).cx;'
