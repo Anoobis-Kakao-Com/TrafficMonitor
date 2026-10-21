@@ -123,14 +123,34 @@ jobs:
               return rect;
           }
 
-          // [patch] Width of the label box = name text + minimum gap + colon that is always appended
-          // after a non-empty name. An empty name gives 0 (no label, only the value is shown).
+          // [patch] Gap between the colon and the value. It is the same for every row that has a name (so the CPU clock,
+          // whose number box is always full, gets the same space as the other items). Read once from config.ini
+          // ([task_bar] value_gap, pixels at 96 DPI, 0 - 30, default 4).
+          static int ValueGap()
+          {
+              static bool loaded = false;
+              static int gap = 4;
+              if (!loaded)
+              {
+                  loaded = true;
+                  CIniHelper ini{ theApp.m_config_path };
+                  gap = ini.GetInt(L"task_bar", L"value_gap", 4);
+                  if (gap < 0)
+                      gap = 0;
+                  if (gap > 30)
+                      gap = 30;
+              }
+              return theApp.DPI(gap);
+          }
+
+          // [patch] Width of the label box = name text + minimum gap + colon (always appended after a non-empty name)
+          // + the gap between the colon and the value. An empty name gives 0 (no label, only the value is shown).
           static int LabelBoxWidth(CDC* pDC, const wchar_t* text)
           {
               if (pDC == nullptr || text == nullptr || text[0] == L'\0')
                   return 0;
               std::wstring str(text);
-              return pDC->GetTextExtent(str.c_str(), static_cast<int>(str.size())).cx + theApp.DPI(2) + pDC->GetTextExtent(L":", 1).cx;
+              return pDC->GetTextExtent(str.c_str(), static_cast<int>(str.size())).cx + theApp.DPI(2) + pDC->GetTextExtent(L":", 1).cx + ValueGap();
           }
 
           // [patch] Color of one piece of a label. Exception for the total speed item: its up arrow uses the
@@ -182,7 +202,8 @@ jobs:
               int colon_w = pDC->GetTextExtent(L":", 1).cx;
               int name_w = pDC->GetTextExtent(str.c_str(), static_cast<int>(str.size())).cx;
               int gap = theApp.DPI(2);                           // minimum gap between the name and the colon
-              int extra = (label_width - colon_w - gap) - name_w;     // free space inside the name box
+              int value_gap = ValueGap();                        // gap between the colon and the value
+              int extra = (label_width - colon_w - gap - value_gap) - name_w;     // free space inside the name box
               std::vector<int> x_pos;
               std::vector<std::wstring> pieces;
               if (extra > 0 || split_colors)
@@ -216,7 +237,7 @@ jobs:
 
               // colon (same position in every row of the column, own label color)
               CRect rc = rect_label;
-              rc.left = rect_label.left + label_width - colon_w;
+              rc.left = rect_label.left + label_width - colon_w - value_gap;
               rc.right = rect_label.right + 8;
               drawer.DrawWindowText(ExpandV(rc), L":", color, IDrawCommon::Alignment::LEFT);
           }
@@ -228,12 +249,13 @@ jobs:
               return (c >= L'0' && c <= L'9') || c == L'.' || c == L',' || c == L'-' || c == L'+' || c == 0x2212;
           }
 
-          // [patch] Width of the value box. The number box comes from the sample text (maximum number of digits,
-          // so it stays stable); the unit box comes from the unit of the value that is shown right now, so that no
-          // extra space is left behind the unit (the layout is recalculated every second by TrafficMonitor).
+          // [patch] Width of the value box, from the SAMPLE text only (the maximum width), so the layout never changes
+          // with the value that is shown right now (TrafficMonitor recalculates the layout every second; a width that
+          // followed the current value made the whole window jump left and right). The number part (maximum number of
+          // digits) and the unit part of the sample are measured separately.
           // Returns number width + unit width and stores the number width in num_width
           // (num_width = 0 means the sample has no number part: keep the old behaviour).
-          static int ValueBoxWidths(CDC* pDC, const wchar_t* sample, const wchar_t* actual, int& num_width)
+          static int ValueBoxWidths(CDC* pDC, const wchar_t* sample, int& num_width)
           {
               num_width = 0;
               if (pDC == nullptr || sample == nullptr || sample[0] == L'\0')
@@ -245,27 +267,12 @@ jobs:
               if (n == 0)
                   return pDC->GetTextExtent(str.c_str(), static_cast<int>(str.size())).cx;
               num_width = pDC->GetTextExtent(str.c_str(), static_cast<int>(n)).cx;
-
-              std::wstring unit;
-              std::wstring act(actual != nullptr ? actual : L"");
-              size_t an = 0;
-              while (an < act.size() && IsNumberChar(act[an]))
-                  ++an;
-              if (an > 0)                                   // the current value has a number: use its unit
-              {
-                  size_t am = an;
-                  while (am < act.size() && (act[am] == L' ' || act[am] == 0x00A0))
-                      ++am;
-                  unit = act.substr(am);
-              }
-              else                                          // no usable current value: use the unit of the sample
-              {
-                  size_t m = n;
-                  while (m < str.size() && (str[m] == L' ' || str[m] == 0x00A0))
-                      ++m;
-                  unit = str.substr(m);
-              }
-              int unit_width = unit.empty() ? 0 : pDC->GetTextExtent(unit.c_str(), static_cast<int>(unit.size())).cx;
+              size_t m = n;
+              while (m < str.size() && (str[m] == L' ' || str[m] == 0x00A0))      // no gap between number and unit
+                  ++m;
+              int unit_width = 0;
+              if (m < str.size())
+                  unit_width = pDC->GetTextExtent(str.c_str() + m, static_cast<int>(str.size() - m)).cx;
               return num_width + unit_width;
           }
 
@@ -422,9 +429,9 @@ jobs:
                   }
                   DrawSplitValue(drawer, m_pDC, &m_font, m_window_height, rect_value, item->GetItemValueText(), num_width, label_width > 0 || align_units, label_width > 0, value_text_color, value_alignment, vertical);"""
           sw1_old = 'value_width = m_pDC->GetTextExtent(plugin->GetItemValueSampleText()).cx;'
-          sw1_new = 'value_width = ValueBoxWidths(m_pDC, plugin->GetItemValueSampleText(), plugin->GetItemValueText(), item_widths[plugin].num_width);'
+          sw1_new = 'value_width = ValueBoxWidths(m_pDC, plugin->GetItemValueSampleText(), item_widths[plugin].num_width);'
           sw2_old = 'item_widths[*iter].value_width = m_pDC->GetTextExtent(sample_str).cx;'
-          sw2_new = 'item_widths[*iter].value_width = ValueBoxWidths(m_pDC, sample_str, iter->GetItemValueText(false), item_widths[*iter].num_width);'
+          sw2_new = 'item_widths[*iter].value_width = ValueBoxWidths(m_pDC, sample_str, item_widths[*iter].num_width);'
 
           # custom drawn plugin items (icon + text, indicators, ...): center the whole item in its column
           c_old = 'drawer.SetTextColor(value_text_color);'
