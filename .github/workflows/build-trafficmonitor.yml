@@ -101,40 +101,17 @@ jobs:
               return r;
           }
 
-          // [patch] If the text of a row would stick out of the taskbar window (top of the upper row / bottom of the
-          // lower row, e.g. the tail of "g" or a tall glyph), shift the row rectangle (and with it the centered text)
-          // back into the window. Nothing happens when the text fits.
-          static CRect ShiftIntoWindow(CDC* pDC, CFont* font, CRect rect, int win_h)
-          {
-              if (pDC == nullptr || font == nullptr || win_h <= 0)
-                  return rect;
-              CFont* old_font = pDC->SelectObject(font);
-              int text_h = pDC->GetTextExtent(L"Ag", 2).cy;
-              pDC->SelectObject(old_font);
-              int text_top = (rect.top + rect.bottom - text_h) / 2;
-              int text_bottom = text_top + text_h;
-              int shift = 0;
-              if (text_top < 0)
-                  shift = -text_top;
-              else if (text_bottom > win_h)
-                  shift = win_h - text_bottom;
-              if (shift != 0)
-                  rect.OffsetRect(0, shift);
-              return rect;
-          }
-
-          // [patch] Gap between the colon and the value. It is the same for every row that has a name (so the CPU clock,
-          // whose number box is always full, gets the same space as the other items). Read once from config.ini
-          // ([task_bar] value_gap, pixels at 96 DPI, 0 - 30, default 4).
-          static int ValueGap()
+          // [patch] Gap on both sides of the colon (name - colon - value), one setting for all rows that have a name.
+          // Read once from config.ini ([task_bar] colon_gap, pixels at 96 DPI, 0 - 30, default 2).
+          static int ColonGap()
           {
               static bool loaded = false;
-              static int gap = 4;
+              static int gap = 2;
               if (!loaded)
               {
                   loaded = true;
                   CIniHelper ini{ theApp.m_config_path };
-                  gap = ini.GetInt(L"task_bar", L"value_gap", 4);
+                  gap = ini.GetInt(L"task_bar", L"colon_gap", 2);
                   if (gap < 0)
                       gap = 0;
                   if (gap > 30)
@@ -143,14 +120,14 @@ jobs:
               return theApp.DPI(gap);
           }
 
-          // [patch] Width of the label box = name text + minimum gap + colon (always appended after a non-empty name)
-          // + the gap between the colon and the value. An empty name gives 0 (no label, only the value is shown).
+          // [patch] Width of the label box = name text + gap + colon (always appended after a non-empty name) + gap.
+          // An empty name gives 0 (no label, only the value is shown).
           static int LabelBoxWidth(CDC* pDC, const wchar_t* text)
           {
               if (pDC == nullptr || text == nullptr || text[0] == L'\0')
                   return 0;
               std::wstring str(text);
-              return pDC->GetTextExtent(str.c_str(), static_cast<int>(str.size())).cx + theApp.DPI(2) + pDC->GetTextExtent(L":", 1).cx + ValueGap();
+              return pDC->GetTextExtent(str.c_str(), static_cast<int>(str.size())).cx + ColonGap() + pDC->GetTextExtent(L":", 1).cx + ColonGap();
           }
 
           // [patch] Color of one piece of a label. Exception for the total speed item: its up arrow uses the
@@ -179,7 +156,6 @@ jobs:
               std::wstring str(text != nullptr ? text : L"");
               if (str.empty())
                   return;
-              rect_label = ShiftIntoWindow(pDC, font, rect_label, win_h);
               if (vertical || pDC == nullptr || font == nullptr || label_width <= 0)
               {
                   drawer.DrawWindowText(ExpandV(rect_label), str.c_str(), color, vertical ? IDrawCommon::Alignment::CENTER : IDrawCommon::Alignment::LEFT);
@@ -201,9 +177,8 @@ jobs:
               CFont* old_font = pDC->SelectObject(font);
               int colon_w = pDC->GetTextExtent(L":", 1).cx;
               int name_w = pDC->GetTextExtent(str.c_str(), static_cast<int>(str.size())).cx;
-              int gap = theApp.DPI(2);                           // minimum gap between the name and the colon
-              int value_gap = ValueGap();                        // gap between the colon and the value
-              int extra = (label_width - colon_w - gap - value_gap) - name_w;     // free space inside the name box
+              int gap = ColonGap();                              // gap on both sides of the colon
+              int extra = (label_width - colon_w - gap - gap) - name_w;     // free space inside the name box
               std::vector<int> x_pos;
               std::vector<std::wstring> pieces;
               if (extra > 0 || split_colors)
@@ -237,7 +212,7 @@ jobs:
 
               // colon (same position in every row of the column, own label color)
               CRect rc = rect_label;
-              rc.left = rect_label.left + label_width - colon_w - value_gap;
+              rc.left = rect_label.left + label_width - colon_w - gap;
               rc.right = rect_label.right + 8;
               drawer.DrawWindowText(ExpandV(rc), L":", color, IDrawCommon::Alignment::LEFT);
           }
@@ -300,7 +275,6 @@ jobs:
           static void DrawSplitValue(IDrawCommon& drawer, CDC* pDC, CFont* font, int win_h, CRect rect_value, const wchar_t* text, int num_width, bool split_mode, bool has_label, COLORREF color, IDrawCommon::Alignment original_alignment, bool vertical)
           {
               std::wstring str(text != nullptr ? text : L"");
-              rect_value = ShiftIntoWindow(pDC, font, rect_value, win_h);
               if (vertical || str.empty())
               {
                   drawer.DrawWindowText(ExpandV(rect_value), str.c_str(), color, original_alignment);
@@ -436,8 +410,7 @@ jobs:
           # custom drawn plugin items (icon + text, indicators, ...): center the whole item in its column
           c_old = 'drawer.SetTextColor(value_text_color);'
           c_new = c_old + r"""
-                  // [patch] the custom drawn item (everything it draws, e.g. icon + text) is treated as one block and
-                  // centered in the width of its column
+                  // [patch] custom drawn item (icon + text, indicators, ...)
                   {
                       int own_width = 0;
                       CommonDisplayItem key(item);
@@ -449,11 +422,59 @@ jobs:
                               break;
                           }
                       }
-                      if (own_width > 0 && rect.Width() > own_width)
+
+                      // A plugin that exports TMHostTextIconWidth() draws only its icon and lets the host draw the number,
+                      // so the number has exactly the font, rendering and vertical position of the text of every other item.
+                      int host_icon_w = 0;
+                      if (plugin != nullptr)
                       {
-                          int offset = (rect.Width() - own_width) / 2;
-                          rect.left += offset;
-                          rect.right = rect.left + own_width;
+                          for (const auto& info : theApp.m_plugins.GetPlugins())
+                          {
+                              if (info.plugin == plugin && info.plugin_module != nullptr)
+                              {
+                                  typedef int (*pfHostTextIconWidth)();
+                                  pfHostTextIconWidth fn = reinterpret_cast<pfHostTextIconWidth>(GetProcAddress(info.plugin_module, "TMHostTextIconWidth"));
+                                  if (fn != nullptr)
+                                      host_icon_w = fn();
+                                  break;
+                              }
+                          }
+                      }
+                      if (host_icon_w > 0)
+                      {
+                          std::wstring host_text(item->GetItemValueText() != nullptr ? item->GetItemValueText() : L"");
+                          CFont* old_font = m_pDC->SelectObject(&m_font);
+                          int text_w = m_pDC->GetTextExtent(host_text.c_str(), static_cast<int>(host_text.size())).cx;
+                          m_pDC->SelectObject(old_font);
+                          // icon + number are one block, centered in the column
+                          int offset = (rect.Width() - (host_icon_w + text_w)) / 2;
+                          if (offset < 0)
+                              offset = 0;
+                          int block_left = rect.left + offset;
+                          CRect rect_text = rect;
+                          rect_text.left = block_left + host_icon_w;
+                          rect_text.right = rect_text.left + text_w + 8;
+                          drawer.DrawWindowText(ExpandV(rect_text), host_text.c_str(), value_text_color, IDrawCommon::Alignment::LEFT);
+                          // one-shot request: the next DrawItem call of the plugin draws only the icon
+                          plugin->OnExtenedInfo(static_cast<ITMPlugin::ExtendedInfoIndex>(900), L"1");
+                          rect.left = block_left;
+                          rect.right = block_left + host_icon_w;
+                      }
+                      else
+                      {
+                          // keep the drawing area inside the taskbar window: the vertical margin moves the rows partly out of
+                          // the window, and what is drawn there (e.g. the frames of the keyboard indicator) was cut off
+                          if (rect.top < 0)
+                              rect.top = 0;
+                          if (m_window_height > 0 && rect.bottom > m_window_height)
+                              rect.bottom = m_window_height;
+                          // the whole item is one block centered in the width of its column
+                          if (own_width > 0 && rect.Width() > own_width)
+                          {
+                              int offset = (rect.Width() - own_width) / 2;
+                              rect.left += offset;
+                              rect.right = rect.left + own_width;
+                          }
                       }
                   }"""
 
@@ -534,27 +555,47 @@ jobs:
                   out = b'\xef\xbb\xbf' + out
               open(path, 'wb').write(out)
 
-          # Battery plugin (TrafficMonitorPlugins): no space between number and %, icon + number centered as a whole
+          # Battery plugin (TrafficMonitorPlugins)
+          #  - no space between number and %
+          #  - cooperation with the patched TrafficMonitor: with "number beside icon" the plugin draws ONLY the icon and the
+          #    host draws the number exactly like every other text (same font, rendering and vertical position)
+          #  - without the patched host the plugin draws icon + number itself, as one block centered in the given width
           patch('plugins_src/Plugins/Battery/DataManager.cpp', [
               ("""            if (m_sysPowerStatus.BatteryLifePercent < 100)
                           str.push_back(L' ');
                       str.push_back(L'%');""", """            str.push_back(L'%');"""),
           ])
           patch('plugins_src/Plugins/Battery/BatteryItem.cpp', [
+              ("static double battery_percent = 0.0;",
+               "bool g_host_draws_text = false;      // [patch] one-shot request of the host: draw only the icon\nstatic double battery_percent = 0.0;"),
+              ("rc_text.left = rect.left + icon_size + g_data.DPI(4);",
+               "rc_text.left = icon_point.x + icon_size + g_data.DPI(2);"),
+              ("pDC->DrawText(battery_str.c_str(), rc_text, DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);",
+               "if (!host_draws_text)\n            pDC->DrawText(battery_str.c_str(), rc_text, DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);"),
               ("""    CPoint icon_point{ rect.TopLeft() };
-              icon_point.x = rect.left + g_data.DPI(2);""", """    // [patch] icon + number are one block that is centered in the given width
+              icon_point.x = rect.left + g_data.DPI(2);""", """    // [patch] the host draws the number itself when it asked for it right before this call (one-shot)
+              bool host_draws_text = g_host_draws_text && g_data.m_setting_data.battery_type == BatteryType::NUMBER_BESIDE_ICON;
+              g_host_draws_text = false;
+              // icon + number are one block that is centered in the given width (icon only when the host draws the number)
               int content_w = icon_size;
-              if (g_data.m_setting_data.battery_type == BatteryType::NUMBER_BESIDE_ICON)
+              if (!host_draws_text && g_data.m_setting_data.battery_type == BatteryType::NUMBER_BESIDE_ICON)
               {
                   std::wstring size_str{ g_data.GetBatteryString() };
                   content_w += g_data.DPI(2) + pDC->GetTextExtent(size_str.c_str(), static_cast<int>(size_str.size())).cx;
               }
-              int block_offset = (rect.Width() - content_w) / 2;
+              int block_offset = host_draws_text ? 0 : (rect.Width() - content_w) / 2;
               if (block_offset < 0)
                   block_offset = 0;
               CPoint icon_point{ rect.TopLeft() };
               icon_point.x = rect.left + block_offset;"""),
-              ('rc_text.left = rect.left + icon_size + g_data.DPI(4);', 'rc_text.left = icon_point.x + icon_size + g_data.DPI(2);'),
+          ])
+          patch('plugins_src/Plugins/Battery/Battery.cpp', [
+              ("void CBattery::OnExtenedInfo(ExtendedInfoIndex index, const wchar_t* data)",
+               "extern bool g_host_draws_text;\n\nvoid CBattery::OnExtenedInfo(ExtendedInfoIndex index, const wchar_t* data)"),
+              ("    case ITMPlugin::EI_CONFIG_DIR:",
+               "    case static_cast<ITMPlugin::ExtendedInfoIndex>(900):     // [patch] the host will draw the number\n        g_host_draws_text = (data != nullptr && wcscmp(data, L\"1\") == 0);\n        break;\n    case ITMPlugin::EI_CONFIG_DIR:"),
+              ("ITMPlugin* TMPluginGetInstance()",
+               "// [patch] Cooperation with the patched TrafficMonitor: with the number beside the icon the host draws the\n// number itself. Returns the width of the icon block (icon + gap), 0 if the host has nothing to do.\nextern \"C\" __declspec(dllexport) int TMHostTextIconWidth()\n{\n    AFX_MANAGE_STATE(AfxGetStaticModuleState());\n    if (g_data.m_setting_data.battery_type != BatteryType::NUMBER_BESIDE_ICON)\n        return 0;\n    return g_data.DPI(16) + g_data.DPI(2);\n}\n\nITMPlugin* TMPluginGetInstance()"),
           ])
           print('battery patches applied')
 
