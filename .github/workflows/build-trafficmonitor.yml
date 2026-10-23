@@ -462,12 +462,6 @@ jobs:
                       }
                       else
                       {
-                          // keep the drawing area inside the taskbar window: the vertical margin moves the rows partly out of
-                          // the window, and what is drawn there (e.g. the frames of the keyboard indicator) was cut off
-                          if (rect.top < 0)
-                              rect.top = 0;
-                          if (m_window_height > 0 && rect.bottom > m_window_height)
-                              rect.bottom = m_window_height;
                           // the whole item is one block centered in the width of its column
                           if (own_width > 0 && rect.Width() > own_width)
                           {
