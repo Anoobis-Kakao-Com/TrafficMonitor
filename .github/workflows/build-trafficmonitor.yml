@@ -102,16 +102,16 @@ jobs:
           }
 
           // [patch] Gap on both sides of the colon (name - colon - value), one setting for all rows that have a name.
-          // Read once from config.ini ([task_bar] colon_gap, pixels at 96 DPI, 0 - 30, default 2).
+          // Read once from config.ini ([task_bar] colon_gap, pixels at 96 DPI, 0 - 30, default 1).
           static int ColonGap()
           {
               static bool loaded = false;
-              static int gap = 2;
+              static int gap = 1;
               if (!loaded)
               {
                   loaded = true;
                   CIniHelper ini{ theApp.m_config_path };
-                  gap = ini.GetInt(L"task_bar", L"colon_gap", 2);
+                  gap = ini.GetInt(L"task_bar", L"colon_gap", 1);
                   if (gap < 0)
                       gap = 0;
                   if (gap > 30)
@@ -462,6 +462,18 @@ jobs:
                       }
                       else
                       {
+                          // keep the drawing area inside the taskbar window, symmetric around the center of the row: the item
+                          // still follows the vertical margin (the center stays), but it gets smaller instead of being cut
+                          // off at the window edge (the vertical margin pushes the rows partly out of the window)
+                          if (m_window_height > 0 && (rect.top < 0 || rect.bottom > m_window_height))
+                          {
+                              int center2 = rect.top + rect.bottom;                  // twice the center of the row
+                              int half2 = min(rect.bottom - rect.top, min(center2, 2 * m_window_height - center2));
+                              if (half2 < 2)
+                                  half2 = 2;
+                              rect.top = (center2 - half2) / 2;
+                              rect.bottom = (center2 + half2) / 2;
+                          }
                           // the whole item is one block centered in the width of its column
                           if (own_width > 0 && rect.Width() > own_width)
                           {
@@ -591,6 +603,44 @@ jobs:
               ("ITMPlugin* TMPluginGetInstance()",
                "// [patch] Cooperation with the patched TrafficMonitor: with the number beside the icon the host draws the\n// number itself. Returns the width of the icon block (icon + gap), 0 if the host has nothing to do.\nextern \"C\" __declspec(dllexport) int TMHostTextIconWidth()\n{\n    AFX_MANAGE_STATE(AfxGetStaticModuleState());\n    if (g_data.m_setting_data.battery_type != BatteryType::NUMBER_BESIDE_ICON)\n        return 0;\n    return g_data.DPI(16) + g_data.DPI(2);\n}\n\nITMPlugin* TMPluginGetInstance()"),
           ])
+          # Icon colors by power state: discharging = red, charging = green, plugged in but not charging (full or charge
+          # limit reached) = blue. The level bars keep their shape (the plugged-in bar has a notch for the lightning bolt).
+          patch('plugins_src/Plugins/Battery/BatteryItem.cpp', [
+              ("void CBatteryItem::DrawItem(void* hDC, int x, int y, int w, int h, bool dark_mode)", r"""// [patch] Draws an icon with all its pixels in one color (shape and alpha of the icon are kept), optionally
+          // clipped to a rectangle. Used for the blue level bar (plugged in, not charging).
+          static void DrawTintedIcon(HDC hdc, HICON hIcon, int x, int y, int size, COLORREF color, const Gdiplus::RectF* clip)
+          {
+              Gdiplus::Bitmap bmp(hIcon);
+              if (bmp.GetLastStatus() != Gdiplus::Ok)
+                  return;
+              const float r = GetRValue(color) / 255.0f;
+              const float g = GetGValue(color) / 255.0f;
+              const float b = GetBValue(color) / 255.0f;
+              Gdiplus::ColorMatrix cm = {{ { 0, 0, 0, 0, 0 }, { 0, 0, 0, 0, 0 }, { 0, 0, 0, 0, 0 }, { 0, 0, 0, 1, 0 }, { r, g, b, 0, 1 } }};
+              Gdiplus::ImageAttributes attr;
+              attr.SetColorMatrix(&cm, Gdiplus::ColorMatrixFlagsDefault, Gdiplus::ColorAdjustTypeBitmap);
+              Gdiplus::Graphics graphics(hdc);
+              graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+              if (clip != nullptr)
+                  graphics.SetClip(*clip);
+              graphics.DrawImage(&bmp, Gdiplus::Rect(x, y, size, size), 0, 0, static_cast<INT>(bmp.GetWidth()), static_cast<INT>(bmp.GetHeight()), Gdiplus::UnitPixel, &attr);
+          }
+
+          void CBatteryItem::DrawItem(void* hDC, int x, int y, int w, int h, bool dark_mode)"""),
+              ("HICON hFill;", "HICON hFill;\n            bool plugged_idle = (g_data.m_sysPowerStatus.BatteryFlag & 8) == 0;      // plugged in but not charging"),
+              ("hFill = g_data.GetIcon(IDI_FILL_CRITICAL);", "hFill = g_data.GetIcon(IDI_FILL_HIGH);"),
+              ("hFill = g_data.GetIcon(IDI_FILL_LOW);", "hFill = g_data.GetIcon(IDI_FILL_HIGH);"),
+              ("::DrawIconEx(pDC->GetSafeHdc(), icon_point.x, icon_point.y, hFill, icon_size, icon_size, 0, NULL, DI_NORMAL);", r"""if (plugged_idle)
+                          DrawTintedIcon(pDC->GetSafeHdc(), hFill, icon_point.x, icon_point.y, icon_size, RGB(30, 144, 255),
+                              g_data.m_sysPowerStatus.BatteryLifePercent < 100 ? &rc_indicater : nullptr);      // blue
+                      else
+                          ::DrawIconEx(pDC->GetSafeHdc(), icon_point.x, icon_point.y, hFill, icon_size, icon_size, 0, NULL, DI_NORMAL);      // green"""),
+              ("CGdiPlusTool::COLORREFToGdiplusColor(g_data.GetBatteryColor())", "CGdiPlusTool::COLORREFToGdiplusColor(BATTERY_COLOR_CRITICAL)"),      # discharging: red
+              # the "charging" animation only while it is really charging (not when plugged in with a full / limited battery)
+              ("g_data.m_setting_data.show_charging_animation && g_data.IsAcOnline() && g_data.m_sysPowerStatus.BatteryLifePercent < 100",
+               "g_data.m_setting_data.show_charging_animation && g_data.IsAcOnline() && (g_data.m_sysPowerStatus.BatteryFlag & 8) != 0 && g_data.m_sysPowerStatus.BatteryLifePercent < 100"),
+          ])
+          print('battery color patches applied')
           print('battery patches applied')
 
       - name: Build Battery plugin (x64)
