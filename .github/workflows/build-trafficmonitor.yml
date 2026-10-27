@@ -120,14 +120,67 @@ jobs:
               return theApp.DPI(gap);
           }
 
-          // [patch] Width of the label box = name text + gap + colon (always appended after a non-empty name) + gap.
+          // [patch] Left bearing (a), ink width (b) and right bearing (c) of a glyph in pixels, measured with the font that is
+          // selected into the DC. The blank space inside a glyph's cell is not what the eye sees as "the gap", so the gaps
+          // around the colon are measured from the visible ink. Without bearing information the advance width is used.
+          static void GlyphInk(CDC* pDC, wchar_t ch, int& a, int& b, int& c)
+          {
+              a = 0;
+              b = 0;
+              c = 0;
+              if (pDC == nullptr)
+                  return;
+              ABC abc = {};
+              if (GetCharABCWidthsW(pDC->GetSafeHdc(), ch, ch, &abc))
+              {
+                  a = abc.abcA;
+                  b = static_cast<int>(abc.abcB);
+                  c = abc.abcC;
+              }
+              else
+              {
+                  b = pDC->GetTextExtent(&ch, 1).cx;
+              }
+          }
+
+          // [patch] What is needed to place the colon (measured with the font selected into the DC).
+          struct ColonLayout
+          {
+              int colon_a;      // left bearing of ':'
+              int colon_b;      // ink width of ':'
+              int name_c;       // right bearing of the last letter of the name
+              int value_a;      // left bearing of a digit (the first character of most values)
+          };
+
+          static ColonLayout MeasureColonLayout(CDC* pDC, const std::wstring& name)
+          {
+              ColonLayout m = {};
+              int a = 0, b = 0, c = 0;
+              GlyphInk(pDC, L':', m.colon_a, m.colon_b, c);
+              GlyphInk(pDC, L'0', m.value_a, b, c);
+              wchar_t last = name.empty() ? L' ' : name.back();
+              if (last >= 0xDC00 && last <= 0xDFFF)           // second half of a surrogate pair: no bearing
+                  m.name_c = 0;
+              else
+                  GlyphInk(pDC, last, a, b, m.name_c);
+              return m;
+          }
+
+          // [patch] Width of the label box (everything in front of the value): the ink of the name, then exactly colon_gap
+          // pixels, the ink of the colon, again exactly colon_gap pixels, and the cell of the first character of the value.
           // An empty name gives 0 (no label, only the value is shown).
           static int LabelBoxWidth(CDC* pDC, const wchar_t* text)
           {
               if (pDC == nullptr || text == nullptr || text[0] == L'\0')
                   return 0;
               std::wstring str(text);
-              return pDC->GetTextExtent(str.c_str(), static_cast<int>(str.size())).cx + ColonGap() + pDC->GetTextExtent(L":", 1).cx + ColonGap();
+              ColonLayout m = MeasureColonLayout(pDC, str);
+              int name_w = pDC->GetTextExtent(str.c_str(), static_cast<int>(str.size())).cx;
+              int gap = ColonGap();
+              int width = (name_w - m.name_c) + gap + m.colon_b + gap - m.value_a;
+              if (width < name_w + m.colon_b)                  // never let the colon touch the name
+                  width = name_w + m.colon_b;
+              return width;
           }
 
           // [patch] Color of one piece of a label. Exception for the total speed item: its up arrow uses the
@@ -175,10 +228,13 @@ jobs:
 
               // measure with the same font as the layout
               CFont* old_font = pDC->SelectObject(font);
-              int colon_w = pDC->GetTextExtent(L":", 1).cx;
               int name_w = pDC->GetTextExtent(str.c_str(), static_cast<int>(str.size())).cx;
-              int gap = ColonGap();                              // gap on both sides of the colon
-              int extra = (label_width - colon_w - gap - gap) - name_w;     // free space inside the name box
+              int gap = ColonGap();                              // gap on both sides of the colon (between the ink)
+              ColonLayout m = MeasureColonLayout(pDC, str);
+              // origin of the colon glyph: its ink starts exactly 'gap' behind the ink of the longest name of the column,
+              // and the value starts exactly 'gap' behind the ink of the colon
+              int colon_x = label_width - gap - m.colon_b - m.colon_a + m.value_a;
+              int extra = (colon_x + m.colon_a - gap) - (name_w - m.name_c);     // free space inside the name box
               std::vector<int> x_pos;
               std::vector<std::wstring> pieces;
               if (extra > 0 || split_colors)
@@ -212,7 +268,7 @@ jobs:
 
               // colon (same position in every row of the column, own label color)
               CRect rc = rect_label;
-              rc.left = rect_label.left + label_width - colon_w - gap;
+              rc.left = rect_label.left + colon_x;
               rc.right = rect_label.right + 8;
               drawer.DrawWindowText(ExpandV(rc), L":", color, IDrawCommon::Alignment::LEFT);
           }
@@ -266,6 +322,29 @@ jobs:
               return pad;
           }
 
+          // [patch] How many pixels the ink of the pad glyph would stick out below the taskbar window. A low line (U+02CD)
+          // sits at the very bottom of the line, and the vertical margin pushes the lower row down, so it was cut off.
+          static int PadBottomOverflow(CDC* pDC, CFont* font, const std::wstring& pad, CRect row, int win_h)
+          {
+              if (pDC == nullptr || font == nullptr || pad.empty() || win_h <= 0)
+                  return 0;
+              wchar_t ch = pad[0];
+              if (ch >= 0xD800 && ch <= 0xDFFF)
+                  return 0;
+              CFont* old_font = pDC->SelectObject(font);
+              TEXTMETRIC tm = {};
+              BOOL got_metrics = pDC->GetTextMetrics(&tm);
+              GLYPHMETRICS gm = {};
+              MAT2 mat = { { 0, 1 }, { 0, 0 }, { 0, 0 }, { 0, 1 } };
+              DWORD result = GetGlyphOutlineW(pDC->GetSafeHdc(), ch, GGO_METRICS, &gm, 0, nullptr, &mat);
+              pDC->SelectObject(old_font);
+              if (!got_metrics || result == GDI_ERROR)
+                  return 0;
+              int line_top = (row.top + row.bottom - tm.tmHeight) / 2;
+              int ink_bottom = line_top + tm.tmAscent + (static_cast<int>(gm.gmBlackBoxY) - gm.gmptGlyphOrigin.y);
+              return ink_bottom > win_h ? ink_bottom - win_h : 0;
+          }
+
           // [patch] Draw a value:
           //  - split_mode (row has a name, or both rows have no name and both values have a unit):
           //                  number right aligned inside the number box, unit left aligned right behind it
@@ -302,8 +381,9 @@ jobs:
               }
               if (num_width <= 0 || n == 0)
               {
-                  // no number part: a row without a name is centered, a row with a name keeps the old alignment
-                  drawer.DrawWindowText(ExpandV(rect_value), str.c_str(), color, has_label ? original_alignment : IDrawCommon::Alignment::CENTER);
+                  // no number part (e.g. "Timeout"): a row without a name is centered, a row with a name starts right behind
+                  // the colon (not right aligned inside the width reserved for the widest value, which looked like a big gap)
+                  drawer.DrawWindowText(ExpandV(rect_value), str.c_str(), color, has_label ? IDrawCommon::Alignment::LEFT : IDrawCommon::Alignment::CENTER);
                   return;
               }
 
@@ -341,6 +421,10 @@ jobs:
                           CRect rect_pad = rect_value;
                           rect_pad.left = rect_value.left - 24;
                           rect_pad.right = rect_value.left + num_width - number_w;
+                          // keep the pad glyph inside the window: move it up by what would stick out at the bottom
+                          int overflow = PadBottomOverflow(pDC, font, pad, rect_value, win_h);
+                          if (overflow > 0)
+                              rect_pad.OffsetRect(0, -overflow);
                           drawer.DrawWindowText(ExpandV(rect_pad), pads.c_str(), color, IDrawCommon::Alignment::RIGHT);
                       }
                   }
