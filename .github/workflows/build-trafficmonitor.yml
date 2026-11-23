@@ -91,6 +91,9 @@ jobs:
         shell: pwsh
         run: |
           $sd = (Resolve-Path ip_src).Path + '\'
+          # IpAddress links utilities.lib, a static library project of the same repository: build it first
+          msbuild ip_src\utilities\utilities.vcxproj -p:Configuration=Release -p:Platform=x64 -p:PlatformToolset=v143 "-p:SolutionDir=$sd"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
           msbuild ip_src\Plugins\IpAddress\IpAddress.vcxproj -p:Configuration=Release -p:Platform=x64 -p:PlatformToolset=v143 "-p:SolutionDir=$sd"
 
       # ---------------------------------------------------------------- PowerMon (Korean settings window)
