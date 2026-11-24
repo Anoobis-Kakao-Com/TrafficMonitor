@@ -48,7 +48,7 @@ jobs:
           ref: Battery_V1.03
           path: plugins_src
 
-      - name: Apply patches (Battery plugin, stage 1 + stage 2 + new icons)
+      - name: Apply patches (Battery plugin, stage 1 + stage 2 + Korean + new icons)
         id: battery_patch
         if: steps.battery_src.outcome == 'success'
         continue-on-error: true
@@ -56,6 +56,7 @@ jobs:
         run: |
           python build/patch_battery_plugin.py
           python build/patch_battery_plugin_stage2.py
+          python build/patch_third_party_plugins.py battery plugins_src/Plugins/Battery build/ko
           cp build/battery_icons/*.ico plugins_src/Plugins/Battery/res/
 
       - name: Build Battery plugin (x64)
@@ -82,7 +83,7 @@ jobs:
         if: steps.ip_src.outcome == 'success'
         continue-on-error: true
         shell: bash
-        run: python build/patch_third_party_plugins.py ipaddress ip_src/Plugins/IpAddress build/ko/KoLocalize.h
+        run: python build/patch_third_party_plugins.py ipaddress ip_src/Plugins/IpAddress build/ko
 
       - name: Build IpAddress plugin (x64)
         id: ip_build
@@ -114,7 +115,7 @@ jobs:
         if: steps.pm_src.outcome == 'success'
         continue-on-error: true
         shell: bash
-        run: python build/patch_third_party_plugins.py powermon pm_src/PowerMonPlugin build/ko/KoLocalize.h
+        run: python build/patch_third_party_plugins.py powermon pm_src/PowerMonPlugin build/ko
 
       - name: Build PowerMon plugin (x64)
         id: pm_build
@@ -143,7 +144,7 @@ jobs:
         if: steps.ping_src.outcome == 'success'
         continue-on-error: true
         shell: bash
-        run: python build/patch_third_party_plugins.py ping ping_src/PingPlugin build/ko/KoLocalize.h
+        run: python build/patch_third_party_plugins.py ping ping_src/PingPlugin build/ko
 
       - name: Build Ping plugin (x64)
         id: ping_build
@@ -195,7 +196,7 @@ jobs:
         run: |
           set -e
           mkdir -p out_plugins
-          cp build/battery_icons/battery_dark.ico build/battery_icons/battery_light.ico build/battery_icons/fill_low.ico build/plugins/
+          cp build/battery_icons/*.ico build/plugins/
           cd build/plugins
           windres WirelessBattery_res.rc -O coff -o wb_res.o
           g++ -std=c++17 -O2 -Wall -shared -static -static-libgcc -static-libstdc++ -s -o ../../out_plugins/WirelessBattery.dll WirelessBattery.cpp wb_res.o -lsetupapi -lbthprops -lgdiplus -lgdi32 -luser32 -lole32 -lws2_32 -ladvapi32
