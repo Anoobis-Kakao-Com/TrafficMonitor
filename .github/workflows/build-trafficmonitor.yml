@@ -1,1 +1,245 @@
+# Build TrafficMonitor (aligned) - TrafficMonitor V1.86 + patches, the patched Battery / IpAddress plugins,
+# Korean settings windows of PowerMon / Ping, and my own plugins (GpuMemory, KeyboardIndicator, WirelessBattery).
+#
+# This file lives in .github/workflows/ . The patch scripts, icons, plugin sources and the Korean language file are
+# in the "build" folder of the same repository (see HANDOVER.md). Everything except TrafficMonitor.exe is built in a
+# step with "continue-on-error": when one plugin fails to build, the other files are still delivered.
+name: Build TrafficMonitor (aligned)
+on:
+  workflow_dispatch:
 
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      # ---------------------------------------------------------------- sources
+      - name: Get build files (this repository)
+        uses: actions/checkout@v4
+
+      - name: Get TrafficMonitor V1.86 source
+        uses: actions/checkout@v4
+        with:
+          repository: zhongyang219/TrafficMonitor
+          ref: V1.86
+          path: tm_src
+
+      # ---------------------------------------------------------------- TrafficMonitor.exe
+      - name: Apply patches (TrafficMonitor, stage 1 + stage 2)
+        shell: bash
+        working-directory: tm_src
+        run: |
+          python ../build/patch_trafficmonitor.py
+          python ../build/patch_trafficmonitor_stage2.py
+
+      - name: Add msbuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build TrafficMonitor (full version, x64)
+        working-directory: tm_src
+        run: msbuild TrafficMonitor.sln -p:Configuration=Release -p:Platform=x64 -p:PlatformToolset=v143 -m
+
+      # ---------------------------------------------------------------- Battery (tag Battery_V1.03)
+      - name: Get Battery plugin source (Battery_V1.03)
+        id: battery_src
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: zhongyang219/TrafficMonitorPlugins
+          ref: Battery_V1.03
+          path: plugins_src
+
+      - name: Apply patches (Battery plugin, stage 1 + stage 2 + Korean)
+        id: battery_patch
+        if: steps.battery_src.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          python build/patch_battery_plugin.py
+          python build/patch_battery_plugin_stage2.py
+          python build/patch_third_party_plugins.py battery plugins_src/Plugins/Battery build/ko
+
+      - name: Build Battery plugin (x64)
+        id: battery_build
+        if: steps.battery_patch.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $sd = (Resolve-Path plugins_src).Path + '\'
+          msbuild plugins_src\Plugins\Battery\Battery.vcxproj -p:Configuration=Release -p:Platform=x64 -p:PlatformToolset=v143 "-p:SolutionDir=$sd"
+
+      # ---------------------------------------------------------------- IpAddress (tag IpAddress_V1.00)
+      - name: Get IpAddress plugin source (IpAddress_V1.00)
+        id: ip_src
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: zhongyang219/TrafficMonitorPlugins
+          ref: IpAddress_V1.00
+          path: ip_src
+
+      - name: "Apply patches (IpAddress: Korean + refresh every 10 seconds)"
+        id: ip_patch
+        if: steps.ip_src.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: python build/patch_third_party_plugins.py ipaddress ip_src/Plugins/IpAddress build/ko
+
+      - name: Build IpAddress plugin (x64)
+        id: ip_build
+        if: steps.ip_patch.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $sd = (Resolve-Path ip_src).Path + '\'
+          # IpAddress links utilities.lib, a static library project of the same repository: build it first
+          msbuild ip_src\utilities\utilities.vcxproj -p:Configuration=Release -p:Platform=x64 -p:PlatformToolset=v143 "-p:SolutionDir=$sd"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          msbuild ip_src\Plugins\IpAddress\IpAddress.vcxproj -p:Configuration=Release -p:Platform=x64 -p:PlatformToolset=v143 "-p:SolutionDir=$sd"
+
+      # ---------------------------------------------------------------- PowerMon (Korean settings window)
+      - name: Get PowerMon source
+        id: pm_src
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ok = $false
+          foreach ($tag in @('1.0.0', 'v1.0.0', 'V1.0.0')) {
+            git clone --depth 1 --branch $tag https://github.com/AzulEterno/PowerMonPlugin-For-TrafficMonitor.git pm_src
+            if ($LASTEXITCODE -eq 0) { $ok = $true; Write-Host "PowerMon tag $tag"; break }
+          }
+          if (-not $ok) { Write-Host 'PowerMon: no release tag found'; exit 1 }
+
+      - name: "Apply patches (PowerMon: Korean)"
+        id: pm_patch
+        if: steps.pm_src.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: python build/patch_third_party_plugins.py powermon pm_src/PowerMonPlugin build/ko
+
+      - name: Build PowerMon plugin (x64)
+        id: pm_build
+        if: steps.pm_patch.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $sd = (Resolve-Path pm_src).Path + '\'
+          msbuild pm_src\PowerMonPlugin\PowerMonPlugin.vcxproj -p:Configuration=Release -p:Platform=x64 -p:PlatformToolset=v143 "-p:SolutionDir=$sd"
+
+      # ---------------------------------------------------------------- Ping (Korean settings window)
+      - name: Get Ping plugin source
+        id: ping_src
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ok = $false
+          foreach ($tag in @('1.0.0', 'v1.0.0', 'V1.0.0')) {
+            git clone --depth 1 --branch $tag https://github.com/wwwroot/TrafficMonitorPingPlugin.git ping_src
+            if ($LASTEXITCODE -eq 0) { $ok = $true; Write-Host "Ping tag $tag"; break }
+          }
+          if (-not $ok) { Write-Host 'Ping: no release tag found'; exit 1 }
+
+      - name: "Apply patches (Ping: Korean)"
+        id: ping_patch
+        if: steps.ping_src.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: python build/patch_third_party_plugins.py ping ping_src/PingPlugin build/ko
+
+      - name: Build Ping plugin (x64)
+        id: ping_build
+        if: steps.ping_patch.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $sd = (Resolve-Path ping_src).Path + '\'
+          msbuild ping_src\PingPlugin\PingPlugin.vcxproj -p:Configuration=Release -p:Platform=x64 -p:PlatformToolset=v143 "-p:SolutionDir=$sd"
+
+      # ---------------------------------------------------------------- my own plugins (MinGW-w64)
+      - name: Set up MinGW-w64
+        id: msys
+        continue-on-error: true
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc
+
+      - name: Build GpuMemory.dll
+        id: gpu_build
+        if: steps.msys.outcome == 'success'
+        continue-on-error: true
+        shell: msys2 {0}
+        run: |
+          set -e
+          mkdir -p out_plugins
+          cd build/plugins
+          g++ -std=c++17 -O2 -Wall -shared -static -static-libgcc -static-libstdc++ -s -o ../../out_plugins/GpuMemory.dll GpuMemory.cpp -lpdh -ldxgi -luuid -lole32 -luser32
+
+      - name: Build KeyboardIndicator.dll
+        id: kb_build
+        if: steps.msys.outcome == 'success'
+        continue-on-error: true
+        shell: msys2 {0}
+        run: |
+          set -e
+          mkdir -p out_plugins
+          cd build/plugins
+          windres KeyboardIndicator_res.rc -O coff -o kb_res.o
+          g++ -std=c++17 -O2 -Wall -shared -static -static-libgcc -static-libstdc++ -s -o ../../out_plugins/KeyboardIndicator.dll KeyboardIndicator.cpp kb_res.o -lgdiplus -lgdi32 -luser32 -lole32
+
+      - name: Build WirelessBattery.dll
+        id: wb_build
+        if: steps.msys.outcome == 'success'
+        continue-on-error: true
+        shell: msys2 {0}
+        run: |
+          set -e
+          mkdir -p out_plugins
+          cp build/shared/BatteryShape.h build/plugins/
+          cd build/plugins
+          windres WirelessBattery_res.rc -O coff -o wb_res.o
+          g++ -std=c++17 -O2 -Wall -shared -static -static-libgcc -static-libstdc++ -s -o ../../out_plugins/WirelessBattery.dll WirelessBattery.cpp wb_res.o -lsetupapi -lbthprops -lgdiplus -lgdi32 -luser32 -lole32 -lws2_32 -ladvapi32
+
+      # ---------------------------------------------------------------- collect
+      - name: Collect files
+        if: always()
+        shell: pwsh
+        env:
+          O_BATTERY: ${{ steps.battery_build.outcome }}
+          O_IP: ${{ steps.ip_build.outcome }}
+          O_PM: ${{ steps.pm_build.outcome }}
+          O_PING: ${{ steps.ping_build.outcome }}
+          O_GPU: ${{ steps.gpu_build.outcome }}
+          O_KB: ${{ steps.kb_build.outcome }}
+          O_WB: ${{ steps.wb_build.outcome }}
+        run: |
+          New-Item -ItemType Directory -Force out/plugins, out/language | Out-Null
+          $script:report = @()
+          Copy-Item tm_src/Bin/x64/Release/TrafficMonitor.exe out/
+          $script:report += 'TrafficMonitor.exe : OK'
+          Copy-Item build/language/Korean.ini out/language/
+          $script:report += 'language/Korean.ini : OK'
+          function Grab($name, $searchRoot, $outcome) {
+            $f = $null
+            if ($outcome -eq 'success' -and (Test-Path $searchRoot)) {
+              $f = Get-ChildItem -Path $searchRoot -Recurse -Filter $name -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            }
+            if ($f) { Copy-Item $f.FullName out/plugins/; $script:report += "plugins/$name : OK" }
+            else { $script:report += "plugins/$name : NOT BUILT (step result: $outcome) - keep your old file" }
+          }
+          Grab 'Battery.dll'           'plugins_src/Bin' $env:O_BATTERY
+          Grab 'IpAddress.dll'         'ip_src/Bin'      $env:O_IP
+          Grab 'PowerMonPlugin.dll'    'pm_src'          $env:O_PM
+          Grab 'PingPlugin.dll'        'ping_src'        $env:O_PING
+          Grab 'GpuMemory.dll'         'out_plugins'     $env:O_GPU
+          Grab 'KeyboardIndicator.dll' 'out_plugins'     $env:O_KB
+          Grab 'WirelessBattery.dll'   'out_plugins'     $env:O_WB
+          $script:report | Set-Content out/BUILD_REPORT.txt
+          $script:report | ForEach-Object { Write-Host $_ }
+
+      - name: Upload build result
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrafficMonitor-aligned
+          path: out/
+          if-no-files-found: error
